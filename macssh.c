@@ -29,6 +29,7 @@
 #include <signal.h>
 #include <string.h>
 #include <libgen.h>
+#include <conio.h>
 
 #include "pgetopt.h"
 #include "protocol.h"
@@ -55,8 +56,14 @@ static int mndp_timeout = 0;
 
 static int keepalive_counter = 0;
 
+/* Keyboard input pipe for cross-thread communication */
+static SOCKET kbd_pipe_recv = INVALID_SOCKET;
+static SOCKET kbd_pipe_send = INVALID_SOCKET;
+
 static char *username = "root";
 static char *password = NULL;
+static int no_auth_mode = 1;
+static int terminal_mode = 0;
 
 struct net_interface *outiface;
 struct mndphost *server = NULL;
@@ -66,7 +73,15 @@ struct args {
 	char **v;
 };
 
+#ifdef NO_SSH
+/* Stub for no-SSH build */
+int plink_main(int argc, char **argv) {
+	fprintf(stderr, "SSH support not available in this build.\n");
+	return 1;
+}
+#else
 extern int plink_main(int argc, char **argv);
+#endif
 
 
 static int handle_packet(struct mt_mactelnet_hdr *pkt, int data_len);
@@ -176,22 +191,70 @@ static int handle_data(struct mt_mactelnet_hdr *pkt, int data_len)
 		/* Using MAC-SSH server must not send authentication request.
 		 * Authentication is handled by tunneled SSH Client and Server.
 		 */
-		if (cpkt.cptype == MT_CPTYPE_ENCRYPTIONKEY)
+		if (cpkt.cptype == MT_CPTYPE_ENCRYPTIONKEY && !no_auth_mode)
 		{
 			fprintf(stderr, "Server %s does not seem to use MAC-SSH Protocol. Please Try using MAC-Telnet instead.\n", macstr(server->address));
 			exit(1);
 		}
 
 		/* If the (remaining) data did not have a control-packet magic byte sequence,
-		   the data is raw terminal data to be tunneled to local SSH Client. */
+		   the data is raw terminal data to be outputted to the terminal. */
 		else if (cpkt.cptype == MT_CPTYPE_PLAINDATA)
 		{
-			if (send(sshclient, (char *)cpkt.data, cpkt.length, 0) < 0)
+			if (no_auth_mode) {
+				/* In no-auth mode, output directly to console */
+				fwrite(cpkt.data, 1, cpkt.length, stdout);
+				fflush(stdout);
+			} else if (send(sshclient, (char *)cpkt.data, cpkt.length, 0) < 0)
 			{
 				fprintf(stderr, "Terminal client disconnected.\n");
 				/* exit */
 				running = 0;
 			}
+		}
+
+		/* Parse next controlpacket */
+		success = parse_control_packet(NULL, 0, &cpkt);
+	}
+
+	return pkt->ptype;
+}
+
+static int handle_data_noauth(struct mt_mactelnet_hdr *pkt, int data_len)
+{
+	struct mt_packet odata;
+	struct mt_mactelnet_control_hdr cpkt;
+	int success = 0;
+
+	/* Always transmit ACKNOWLEDGE packets in response to DATA packets */
+	init_packet(&odata, MT_PTYPE_ACK, outiface->mac_addr, server->address,
+	            sessionkey, pkt->counter + (data_len - MT_HEADER_LEN));
+
+	send_udp(&odata, 0);
+
+	/* Accept first packet, and all packets greater than incounter, and if counter has
+	wrapped around. */
+	if (incounter == 0 || pkt->counter > incounter || (incounter - pkt->counter) > 65535)
+		incounter = pkt->counter;
+	else
+		/* Ignore double or old packets */
+		return -1;
+
+	/* Parse controlpacket data */
+	success = parse_control_packet(pkt->data, data_len - MT_HEADER_LEN, &cpkt);
+
+	while (success)
+	{
+		/* Handle END_AUTH - enter terminal mode */
+		if (cpkt.cptype == MT_CPTYPE_END_AUTH)
+		{
+			terminal_mode = 1;
+		}
+		/* Handle PLAINDATA - output to console */
+		else if (cpkt.cptype == MT_CPTYPE_PLAINDATA)
+		{
+			fwrite(cpkt.data, 1, cpkt.length, stdout);
+			fflush(stdout);
 		}
 
 		/* Parse next controlpacket */
@@ -211,7 +274,10 @@ static int handle_packet(struct mt_mactelnet_hdr *pkt, int data_len)
 	switch (pkt->ptype)
 	{
 	case MT_PTYPE_DATA:
-		return handle_data(pkt, data_len);
+		if (no_auth_mode)
+			return handle_data_noauth(pkt, data_len);
+		else
+			return handle_data(pkt, data_len);
 
 	case MT_PTYPE_ACK:
 		return MT_PTYPE_ACK;
@@ -275,11 +341,16 @@ static int find_interface()
 
 DWORD WINAPI launch_plink(LPVOID lpParam)
 {
+#ifdef NO_SSH
+	fprintf(stderr, "SSH support not available in this build.\n");
+	return 1;
+#else
 	struct args *ssh_arg = (struct args *)lpParam;
 
 	atexit(finish);
 
 	return plink_main(ssh_arg->c, ssh_arg->v);
+#endif
 }
 
 static void select_mndp(void)
@@ -342,6 +413,10 @@ static void select_mndp(void)
 
 static int setup_ssh_socket(int port)
 {
+#ifdef NO_SSH
+	fprintf(stderr, "SSH support not available in this build.\n");
+	return SOCKET_ERROR;
+#else
 	int opt = 1;
 	int sshsock;
 	struct sockaddr_in local;
@@ -379,6 +454,7 @@ err:
 		closesocket(sshsock);
 
 	return SOCKET_ERROR;
+#endif
 }
 
 static int setup_mac_socket(int port)
@@ -419,6 +495,10 @@ err:
 
 static int accept_ssh_client(int sshsock)
 {
+#ifdef NO_SSH
+	fprintf(stderr, "SSH support not available in this build.\n");
+	return SOCKET_ERROR;
+#else
 	struct sockaddr_in remote;
 	int sl = sizeof(remote);
 	int clientsock;
@@ -445,6 +525,29 @@ err:
 		closesocket(clientsock);
 
 	return SOCKET_ERROR;
+#endif
+}
+
+/* Keyboard reader thread: reads console input and sends to main thread via socket pipe */
+DWORD WINAPI keyboard_reader(LPVOID lpParam)
+{
+	while (running)
+	{
+		if (_kbhit())
+		{
+			unsigned char keydata[512];
+			int datalen = 0;
+			while (_kbhit() && datalen < 512)
+				keydata[datalen++] = _getch();
+			if (datalen > 0)
+				send(kbd_pipe_send, (char *)keydata, datalen, 0);
+		}
+		else
+		{
+			Sleep(10);
+		}
+	}
+	return 0;
 }
 
 BOOL WINAPI handle_console_event(DWORD signal)
@@ -509,7 +612,7 @@ int main (int argc, char **argv) {
 		}
 	}
 
-	while ((c = pgetopt(macssh_argc, argv, "qt:u:p:vh?P:")) != -1)
+	while ((c = pgetopt(macssh_argc, argv, "qt:u:p:vh?P:N")) != -1)
 	{
 		switch (c)
 		{
@@ -530,6 +633,10 @@ int main (int argc, char **argv) {
 				mndp_timeout = connect_timeout;
 				break;
 
+			case 'N':
+				no_auth_mode = 1;
+				break;
+
 			case 'v':
 				print_version();
 				exit(0);
@@ -546,8 +653,8 @@ int main (int argc, char **argv) {
 	if (print_help)
 	{
 		print_version();
-		fprintf(stderr, "Usage: %s <MAC|identity> [-v] [-h] [-q] [-n] [-l] [-B] [-S] [-P <port>] "
-		                "[-t <timeout>] [-u <user>] [-p <pass>] [-c <path>] [-U <user>]\n", argv[0]);
+		fprintf(stderr, "Usage: %s <MAC|identity> [-v] [-h] [-q] [-n] [-l] [-B] [-N] "
+		                "[-t <timeout>] [-u <user>] [-p <pass>] [-P <port>]\n", argv[0]);
 
 		if (print_help) {
 			fprintf(stderr, "\nParameters:\n"
@@ -560,12 +667,12 @@ int main (int argc, char **argv) {
 			"  -n             Do not use broadcast packets. Less insecure but requires\n"
 			"                 root privileges.\n"
 			"  -t <timeout>   Amount of seconds to wait for a response on each interface.\n"
-			"  -u <user>      Specify username on command line.\n"
-			"  -p <password>  Specify password on command line.\n"
-			"  -U <user>      Drop privileges to this user. Used in conjunction with -n\n"
-			"                 for security.\n"
-			"  -P <port>      Local TCP port for forwarding SSH connection.\n"
+			"  -u <user>      Specify username on command line (SSH mode only).\n"
+			"  -p <password>  Specify password on command line (SSH mode only).\n"
+			"  -P <port>      Local TCP port for forwarding SSH connection (SSH mode only).\n"
 			"                 (If not specified, port 2222 by default.)\n"
+			"  -N             No authentication mode. Connect directly without SSH.\n"
+			"                 For use with servers running with -c option.\n"
 			"  -q             Quiet mode.\n"
 			"  -v             Print version and exit.\n"
 			"  -h             This help.\n"
@@ -639,22 +746,37 @@ int main (int argc, char **argv) {
 	if ((macrecv = setup_mac_socket(sourceport)) == SOCKET_ERROR)
 		return 1;
 
-	/* Setup Server socket for receiving connection from local SSH Client. */
-	if ((sshserv = setup_ssh_socket(sshport)) == SOCKET_ERROR)
-		return 1;
+	if (!no_auth_mode) {
+		/* Setup Server socket for receiving connection from local SSH Client. */
+		if ((sshserv = setup_ssh_socket(sshport)) == SOCKET_ERROR)
+			return 1;
 
-	/* Fork child to execute SSH Client locally and connect to parent
-	 * waiting for connection from child if launch_ssh is requested.
-	 */
+		/* Fork child to execute SSH Client locally and connect to parent
+		 * waiting for connection from child if launch_ssh is requested.
+		 */
 
-	CreateThread(NULL, 0, launch_plink, &ssh_arg, 0, NULL);
+		CreateThread(NULL, 0, launch_plink, &ssh_arg, 0, NULL);
 
-	/* Wait for remote terminal client connection on server port. */
-	if ((sshclient = accept_ssh_client(sshserv)) == SOCKET_ERROR)
-		return 1;
+		/* Wait for remote terminal client connection on server port. */
+		if ((sshclient = accept_ssh_client(sshserv)) == SOCKET_ERROR)
+			return 1;
+	}
 
 	/* stop output buffering */
 	setvbuf(stdout, (char*)NULL, _IONBF, 0);
+
+	/* Enable Windows Virtual Terminal Processing for ANSI escape sequences */
+	{
+		HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+		HANDLE hIn  = GetStdHandle(STD_INPUT_HANDLE);
+		DWORD outMode = 0, inMode = 0;
+		GetConsoleMode(hOut, &outMode);
+		GetConsoleMode(hIn,  &inMode);
+		/* ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004 */
+		SetConsoleMode(hOut, outMode | 0x0004);
+		/* ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200, disable ENABLE_ECHO_INPUT|ENABLE_LINE_INPUT */
+		SetConsoleMode(hIn,  (inMode & ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT)) | 0x0200);
+	}
 
 	if (!find_interface() || (result = net_recv_packet(macrecv, &hdr, NULL)) < 1) {
 		fprintf(stderr, "MAC connection failed.\n");
@@ -665,56 +787,144 @@ int main (int argc, char **argv) {
 	fprintf(stderr, "\x1D%s) \x1A ", macstr(server->address));
 
 	/* Handle first received packet */
-	if (handle_packet(&hdr, result) >= 0)
-		fprintf(stderr, "SSH\n");
+	if (handle_packet(&hdr, result) >= 0) {
+		if (no_auth_mode)
+			fprintf(stderr, "Direct\n");
+		else
+			fprintf(stderr, "SSH\n");
+	}
 
 	init_packet(&data, MT_PTYPE_DATA, outiface->mac_addr, server->address, sessionkey, 0);
-	outcounter +=  add_control_packet(&data, MT_CPTYPE_BEGINAUTH, NULL, 0);
 
-	/* TODO: handle result of send_udp */
-	result = send_udp(&data, 1);
+	/* Send terminal type and size BEFORE BEGINAUTH so server has them when forking */
+	if (no_auth_mode) {
+		const char *termtype = "xterm";
+		uint16_t width = 80, height = 25;
+		HANDLE hCon = GetStdHandle(STD_OUTPUT_HANDLE);
+		CONSOLE_SCREEN_BUFFER_INFO csbi;
+		if (GetConsoleScreenBufferInfo(hCon, &csbi)) {
+			width  = csbi.srWindow.Right  - csbi.srWindow.Left + 1;
+			height = csbi.srWindow.Bottom - csbi.srWindow.Top  + 1;
+		}
+		outcounter += add_control_packet(&data, MT_CPTYPE_TERM_TYPE, (void *)termtype, strlen(termtype));
+		/* Server uses le16toh, so send as little-endian (x86 native) */
+		uint16_t w = width, h = height;
+		outcounter += add_control_packet(&data, MT_CPTYPE_TERM_WIDTH,  &w, 2);
+		outcounter += add_control_packet(&data, MT_CPTYPE_TERM_HEIGHT, &h, 2);
+	}
 
-	while (running)
-	{
-		/* Wait for data or timeout */
-		if (net_select(1000, macrecv, sshclient) > 0)
+	outcounter += add_control_packet(&data, MT_CPTYPE_BEGINAUTH, NULL, 0);
+
+	/* In no-auth mode, server responds with DATA (END_AUTH), not ACK, so don't retransmit */
+	result = send_udp(&data, no_auth_mode ? 0 : 1);
+
+	if (no_auth_mode) {
+		/* Setup loopback socket pair for keyboard -> network thread communication */
 		{
-			/* Handle data from server */
-			if (net_readable(macrecv, -1))
+			SOCKET srv;
+			struct sockaddr_in sa;
+			int salen = sizeof(sa);
+			srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+			memset(&sa, 0, sizeof(sa));
+			sa.sin_family = AF_INET;
+			sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+			sa.sin_port = 0;
+			bind(srv, (struct sockaddr *)&sa, sizeof(sa));
+			listen(srv, 1);
+			getsockname(srv, (struct sockaddr *)&sa, &salen);
+			kbd_pipe_send = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+			connect(kbd_pipe_send, (struct sockaddr *)&sa, sizeof(sa));
+			kbd_pipe_recv = accept(srv, NULL, NULL);
+			closesocket(srv);
+		}
+	
+		/* Start keyboard reader thread */
+		CreateThread(NULL, 0, keyboard_reader, NULL, 0, NULL);
+	
+		/* No-auth mode: direct console I/O */
+		while (running)
+		{
+			/* Wait for network data or keyboard input */
+			if (net_select(1000, macrecv, kbd_pipe_recv) > 0)
 			{
-				result = net_recv_packet(macrecv, &hdr, NULL);
-
-				if (result > 0)
-					handle_packet(&hdr, result);
+				/* Handle data from server */
+				if (net_readable(macrecv, -1))
+				{
+					result = net_recv_packet(macrecv, &hdr, NULL);
+					if (result > 0)
+						handle_packet(&hdr, result);
+				}
+	
+				/* Handle keyboard input from pipe */
+				if (net_readable(kbd_pipe_recv, -1))
+				{
+					unsigned char keydata[512];
+					int datalen = recv(kbd_pipe_recv, (char *)keydata, sizeof(keydata), 0);
+					if (datalen > 0) {
+						init_packet(&data, MT_PTYPE_DATA, outiface->mac_addr, server->address, sessionkey, outcounter);
+						add_control_packet(&data, MT_CPTYPE_PLAINDATA, &keydata, datalen);
+						outcounter += datalen;
+						send_udp(&data, 0);
+					}
+				}
 			}
-
-			unsigned char keydata[512];
-			int datalen = 0;
-			/* Handle data from local SSH client */
-			if (net_readable(sshclient, -1)) {
-				datalen = recv(sshclient, (char *)keydata, 512, 0);
-				if (datalen <= 0)
-					disconnect(sessionkey);
-			}
-
-			if (datalen > 0) {
-				/* Data received, transmit to server */
-				init_packet(&data, MT_PTYPE_DATA, outiface->mac_addr, server->address, sessionkey, outcounter);
-				add_control_packet(&data, MT_CPTYPE_PLAINDATA, &keydata, datalen);
-				outcounter += datalen;
-				send_udp(&data, 1);
+	
+			/* Handle select() timeout */
+			else
+			{
+				/* handle keepalive counter, transmit keepalive packet every 10 seconds
+				   of inactivity  */
+				if (keepalive_counter++ == 10) {
+					struct mt_packet odata;
+					init_packet(&odata, MT_PTYPE_ACK, outiface->mac_addr, server->address, sessionkey, outcounter);
+					send_udp(&odata, 0);
+				}
 			}
 		}
-
-		/* Handle select() timeout */
-		else
+	} else {
+		/* SSH mode: tunnel through SSH */
+		while (running)
 		{
-			/* handle keepalive counter, transmit keepalive packet every 10 seconds
-			   of inactivity  */
-			if (keepalive_counter++ == 10) {
-				struct mt_packet odata;
-				init_packet(&odata, MT_PTYPE_ACK, outiface->mac_addr, server->address, sessionkey, outcounter);
-				send_udp(&odata, 0);
+			/* Wait for data or timeout */
+			if (net_select(1000, macrecv, sshclient) > 0)
+			{
+				/* Handle data from server */
+				if (net_readable(macrecv, -1))
+				{
+					result = net_recv_packet(macrecv, &hdr, NULL);
+
+					if (result > 0)
+						handle_packet(&hdr, result);
+				}
+
+				unsigned char keydata[512];
+				int datalen = 0;
+				/* Handle data from local SSH client */
+				if (net_readable(sshclient, -1)) {
+					datalen = recv(sshclient, (char *)keydata, 512, 0);
+					if (datalen <= 0)
+						disconnect(sessionkey);
+				}
+
+				if (datalen > 0) {
+					/* Data received, transmit to server */
+					init_packet(&data, MT_PTYPE_DATA, outiface->mac_addr, server->address, sessionkey, outcounter);
+					add_control_packet(&data, MT_CPTYPE_PLAINDATA, &keydata, datalen);
+					outcounter += datalen;
+						send_udp(&data, 1);
+				}
+			}
+
+			/* Handle select() timeout */
+			else
+			{
+				/* handle keepalive counter, transmit keepalive packet every 10 seconds
+				   of inactivity  */
+				if (keepalive_counter++ == 10) {
+					struct mt_packet odata;
+					init_packet(&odata, MT_PTYPE_ACK, outiface->mac_addr, server->address, sessionkey, outcounter);
+					send_udp(&odata, 0);
+				}
 			}
 		}
 	}

@@ -1,5 +1,6 @@
 *.o
 libplink.a
 macssh.exe
+mactelnet.exe
 putty-src.zip
 putty/
