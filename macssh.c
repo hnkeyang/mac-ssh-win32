@@ -376,8 +376,8 @@ static void select_mndp(void)
 				       host->platform, host->version, host->hardware);
 
 			if (host->uptime)
-				printf("  up %d days %d hours",
-				       host->uptime / 86400, host->uptime % 86400 / 3600);
+				printf("  up %d days %d hours, %d min, %d sec",
+				       host->uptime / 86400, host->uptime % 86400 / 3600, host->uptime % 60, host->uptime);
 
 			printf("\n");
 		}
