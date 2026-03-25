@@ -28,6 +28,8 @@
 #include <stdio.h>
 #include <signal.h>
 #include <string.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #include "utils.h"
 #include "protocol.h"
@@ -121,6 +123,29 @@ int mndp_discover(int timeout)
 		if (mndppkt->hardware)
 			mndphost->hardware = strcpy(hardware, mndppkt->hardware);
 
+		/* Store IP addresses if present */
+		mndphost->has_ipv4 = mndppkt->has_ipv4;
+		mndphost->has_ipv6_local = mndppkt->has_ipv6_local;
+		mndphost->has_ipv6_global = mndppkt->has_ipv6_global;
+
+		if (mndppkt->has_ipv4) {
+			mndphost->ipv4_addr = malloc(sizeof(struct in_addr));
+			if (mndphost->ipv4_addr)
+				memcpy(mndphost->ipv4_addr, &mndppkt->ipv4_addr, sizeof(struct in_addr));
+		}
+
+		if (mndppkt->has_ipv6_local) {
+			mndphost->ipv6_local = malloc(sizeof(struct in6_addr));
+			if (mndphost->ipv6_local)
+				memcpy(mndphost->ipv6_local, &mndppkt->ipv6_local, sizeof(struct in6_addr));
+		}
+
+		if (mndppkt->has_ipv6_global) {
+			mndphost->ipv6_global = malloc(sizeof(struct in6_addr));
+			if (mndphost->ipv6_global)
+				memcpy(mndphost->ipv6_global, &mndppkt->ipv6_global, sizeof(struct in6_addr));
+		}
+
 		list_add_tail(&mndphost->list, &mndphosts);
 		found++;
 	}
@@ -145,4 +170,106 @@ struct mndphost * mndp_lookup(const unsigned char *address)
 			return host;
 
 	return NULL;
+}
+
+void mndp_free_hosts(void)
+{
+	struct mndphost *host, *tmp;
+
+	list_for_each_entry_safe(host, tmp, &mndphosts, list)
+	{
+		if (host->has_ipv4 && host->ipv4_addr)
+			free(host->ipv4_addr);
+		if (host->has_ipv6_local && host->ipv6_local)
+			free(host->ipv6_local);
+		if (host->has_ipv6_global && host->ipv6_global)
+			free(host->ipv6_global);
+
+		list_del(&host->list);
+		free(host);
+	}
+}
+
+void mndp_list(int timeout, int batch_mode)
+{
+	struct mndphost *host;
+	int n = 0;
+
+	/* Discover hosts */
+	mndp_discover(timeout);
+
+	if (batch_mode) {
+		printf("MAC-Address,Identity,Platform,Version,Hardware,Uptime,Softid,Ifname,IPv4,IPv6-Local,IPv6-Global\n");
+		list_for_each_entry(host, &mndphosts, list)
+		{
+			printf("'%02X:%02X:%02X:%02X:%02X:%02X','%s',",
+				host->address[0], host->address[1], host->address[2],
+				host->address[3], host->address[4], host->address[5],
+				host->identity ? host->identity : "");
+			printf("'%s','%s','%s',",
+				host->platform ? host->platform : "",
+				host->version ? host->version : "",
+				host->hardware ? host->hardware : "");
+			printf("'%d','','',",
+				host->uptime);
+			/* Print IP addresses */
+			if (host->has_ipv4 && host->ipv4_addr) {
+				printf("'%s',", inet_ntoa(*host->ipv4_addr));
+			} else {
+				printf("','");
+			}
+			if (host->has_ipv6_local && host->ipv6_local) {
+				char ipv6_str[INET6_ADDRSTRLEN];
+				inet_ntop(AF_INET6, host->ipv6_local, ipv6_str, sizeof(ipv6_str));
+				printf("'%s',", ipv6_str);
+			} else {
+				printf("','");
+			}
+			if (host->has_ipv6_global && host->ipv6_global) {
+				char ipv6_str[INET6_ADDRSTRLEN];
+				inet_ntop(AF_INET6, host->ipv6_global, ipv6_str, sizeof(ipv6_str));
+				printf("'%s'", ipv6_str);
+			} else {
+				printf("''");
+			}
+			printf("\n");
+		}
+	} else {
+		printf("\n%-17s %s\n", "MAC-Address", "Identity (platform version hardware) uptime");
+		list_for_each_entry(host, &mndphosts, list)
+		{
+			n++;
+			printf(" %2d) %02X:%02X:%02X:%02X:%02X:%02X %s",
+				n,
+				host->address[0], host->address[1], host->address[2],
+				host->address[3], host->address[4], host->address[5],
+				host->identity ? host->identity : "");
+
+			if (host->platform && host->version && host->hardware)
+				printf(" (%s %s %s)", host->platform, host->version, host->hardware);
+
+			if (host->uptime)
+				printf("  up %d days %02d:%02d:%02d",
+					host->uptime / 86400, host->uptime % 86400 / 3600,
+					host->uptime % 3600 / 60, host->uptime % 60);
+
+			/* Print IP addresses */
+			if (host->has_ipv4 && host->ipv4_addr)
+				printf(" [%s]", inet_ntoa(*host->ipv4_addr));
+			if (host->has_ipv6_local && host->ipv6_local) {
+				char ipv6_str[INET6_ADDRSTRLEN];
+				inet_ntop(AF_INET6, host->ipv6_local, ipv6_str, sizeof(ipv6_str));
+				printf(" [%s]", ipv6_str);
+			}
+			if (host->has_ipv6_global && host->ipv6_global) {
+				char ipv6_str[INET6_ADDRSTRLEN];
+				inet_ntop(AF_INET6, host->ipv6_global, ipv6_str, sizeof(ipv6_str));
+				printf(" [%s]", ipv6_str);
+			}
+
+			printf("\n");
+		}
+		if (n == 0)
+			printf("No hosts found\n");
+	}
 }

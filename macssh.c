@@ -53,6 +53,8 @@ static int sshport = MT_TUNNEL_CLIENT_PORT;
 
 static int connect_timeout = CONNECT_TIMEOUT;
 static int mndp_timeout = 0;
+static int list_mode = 0;
+static int batch_mode = 0;
 
 static int keepalive_counter = 0;
 
@@ -612,7 +614,7 @@ int main (int argc, char **argv) {
 		}
 	}
 
-	while ((c = pgetopt(macssh_argc, argv, "qt:u:p:vh?P:N")) != -1)
+	while ((c = pgetopt(macssh_argc, argv, "qt:u:p:vh?P:NlB")) != -1)
 	{
 		switch (c)
 		{
@@ -636,7 +638,15 @@ int main (int argc, char **argv) {
 			case 'N':
 				no_auth_mode = 1;
 				break;
-
+			
+			case 'l':
+				list_mode = 1;
+				break;
+			
+			case 'B':
+				batch_mode = 1;
+				break;
+			
 			case 'v':
 				print_version();
 				exit(0);
@@ -684,10 +694,20 @@ int main (int argc, char **argv) {
 	}
 
 	net_enum_ifaces();
+
+	/* List mode: just discover and display hosts */
+	if (list_mode) {
+		mndp_list(mndp_timeout > 0 ? mndp_timeout : 3, batch_mode);
+		mndp_free_hosts();
+		return 0;
+	}
+
 	select_mndp();
 
-	if (!server)
+	if (!server) {
+		mndp_free_hosts();
 		return 1;
+	}
 
 	SetConsoleCtrlHandler(handle_console_event, TRUE);
 
@@ -743,13 +763,17 @@ int main (int argc, char **argv) {
 	/* Session key */
 	sessionkey = rand() % 65535;
 
-	if ((macrecv = setup_mac_socket(sourceport)) == SOCKET_ERROR)
+	if ((macrecv = setup_mac_socket(sourceport)) == SOCKET_ERROR) {
+		mndp_free_hosts();
 		return 1;
+	}
 
 	if (!no_auth_mode) {
 		/* Setup Server socket for receiving connection from local SSH Client. */
-		if ((sshserv = setup_ssh_socket(sshport)) == SOCKET_ERROR)
+		if ((sshserv = setup_ssh_socket(sshport)) == SOCKET_ERROR) {
+			mndp_free_hosts();
 			return 1;
+		}
 
 		/* Fork child to execute SSH Client locally and connect to parent
 		 * waiting for connection from child if launch_ssh is requested.
@@ -758,8 +782,10 @@ int main (int argc, char **argv) {
 		CreateThread(NULL, 0, launch_plink, &ssh_arg, 0, NULL);
 
 		/* Wait for remote terminal client connection on server port. */
-		if ((sshclient = accept_ssh_client(sshserv)) == SOCKET_ERROR)
+		if ((sshclient = accept_ssh_client(sshserv)) == SOCKET_ERROR) {
+			mndp_free_hosts();
 			return 1;
+		}
 	}
 
 	/* stop output buffering */
@@ -780,6 +806,7 @@ int main (int argc, char **argv) {
 
 	if (!find_interface() || (result = net_recv_packet(macrecv, &hdr, NULL)) < 1) {
 		fprintf(stderr, "MAC connection failed.\n");
+		mndp_free_hosts();
 		return 1;
 	}
 
@@ -933,6 +960,8 @@ int main (int argc, char **argv) {
 
 	if (sshclient > 0)
 		closesocket(sshclient);
+
+	mndp_free_hosts();
 
 	return 0;
 }

@@ -38,6 +38,12 @@ struct mndphost {
 	char *version;
 	char *hardware;
 	unsigned int uptime;
+	struct in_addr *ipv4_addr;
+	struct in6_addr *ipv6_local;
+	struct in6_addr *ipv6_global;
+	unsigned char has_ipv4;
+	unsigned char has_ipv6_local;
+	unsigned char has_ipv6_global;
 
 	struct list_head list;
 };
@@ -46,5 +52,7 @@ int mndp(int timeout, int batch_mode);
 
 int mndp_discover(int timeout);
 struct mndphost * mndp_lookup(const unsigned char *address);
+void mndp_free_hosts(void);
+void mndp_list(int timeout, int batch_mode);
 
 #endif
