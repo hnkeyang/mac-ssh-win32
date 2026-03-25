@@ -40,6 +40,8 @@ If you intend to build it on other distributions or with other variants of the
 MinGW toolchain you might need to change the TOOLPATH variable in Makefile to
 suit your needs.
 
+apt-get install gcc-mingw-w64
+
 To build MAC-SSH clone the sources and execute "make" - the resulting
 "macssh.exe" utility will be placed in the same directory.
 
