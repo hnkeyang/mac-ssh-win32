@@ -4,7 +4,7 @@ CC=$(TOOLPATH)gcc
 AR=$(TOOLPATH)ar
 WINDRES=$(TOOLPATH)windres
 #VERSION=\"git-$(shell git log -1 --format="%h" HEAD)\"
-VERSION=\"0.2\"
+VERSION=\"0.2.1\"
 CFLAGS+=-DWINVER=0x0500 -DNO_SSH -DPROGRAM_VERSION=$(VERSION)
 LIBS_TELNET?=-L. -liphlpapi -lws2_32
 LIBS_CONNECT?=-L. -liphlpapi -lws2_32 -lcomctl32 -mwindows
