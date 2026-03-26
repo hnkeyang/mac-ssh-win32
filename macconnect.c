@@ -24,6 +24,7 @@
 #include "utils.h"
 #include "mndp.h"
 #include "mactelnet_conn.h"
+#include "ssh_conn.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -37,7 +38,9 @@
 #define IDM_CONTEXT_COPY 4001
 #define IDM_CONTEXT_CONNECT 4002
 
+#define IDC_PROTOCOL 100
 #define IDC_MAC_ADDRESS 101
+#define IDC_PORT 102
 #define IDC_CONNECT_BTN 106
 #define IDC_REFRESH_BTN 107
 #define IDC_DEVICE_LIST 108
@@ -54,6 +57,12 @@
 #define COL_VERSION 4
 #define COL_BOARD 5
 #define COL_UPTIME 6
+
+/* Protocol types */
+enum {
+	PROTOCOL_MAC_TELNET = 0,
+	PROTOCOL_SSH = 1
+};
 
 /* Terminal window dimensions */
 #define TERM_WIDTH 80
@@ -100,6 +109,11 @@ struct terminal {
 	int scroll_bottom; /* Bottom row of scroll region (0-based) */
 };
 
+/* Connection type */
+#define CONN_TYPE_NONE    0
+#define CONN_TYPE_MAC     1
+#define CONN_TYPE_SSH     2
+
 /* Connection context for callbacks */
 struct conn_context {
 	HWND hTerminal;
@@ -112,7 +126,10 @@ struct conn_context {
 static HINSTANCE hInst;
 static HWND hMainWnd;
 static HWND hDeviceList;
+static HWND hProtocolCombo;
 static HWND hMacEdit;
+static HWND hPortEdit;
+static HWND hPortLabel;
 static HWND hConnectBtn;
 static HWND hRefreshBtn;
 static HWND hStatusBar;
@@ -128,6 +145,20 @@ static struct terminal g_term = {0};
 static struct conn_context g_conn_ctx = {0};
 static mactelnet_conn_t g_conn;
 
+/* SSH connection globals */
+static ssh_conn_t g_ssh_conn;
+static int g_conn_type = CONN_TYPE_NONE;
+
+/* SSH connection target (set by OnConnect, read by SshAuthThreadProc) */
+static char g_ssh_host[256];
+static int  g_ssh_port = 22;
+
+/* SSH auth line input state (used from SSH auth thread) */
+static CRITICAL_SECTION g_ssh_input_cs;
+static char g_ssh_input_line[256];
+static volatile BOOL g_ssh_input_ready = FALSE;
+static volatile BOOL g_ssh_input_echo = TRUE;  /* FALSE while reading password */
+
 /* Function prototypes */
 static BOOL InitApplication(HINSTANCE hInstance);
 static BOOL InitInstance(HINSTANCE hInstance, int nCmdShow);
@@ -139,7 +170,7 @@ static void RefreshDeviceList(void);
 static DWORD WINAPI DiscoverThreadProc(LPVOID lpParam);
 static void AddDeviceToList(struct mndphost *host);
 static void UpdateDeviceListView(void);
-static void OnDeviceSelected(int index);
+static void OnDeviceSelected(int index, int column);
 static void OnConnect(void);
 static void FormatUptime(unsigned int uptime, char *buf, size_t buflen);
 static void CopySelectedCellToClipboard(void);
@@ -152,18 +183,43 @@ static void TerminalPaint(HWND hWnd);
 static void TerminalPutChar(char c);
 static void TerminalProcessData(const unsigned char *data, int len);
 static DWORD WINAPI TerminalThreadProc(LPVOID lpParam);
+static DWORD WINAPI SshTerminalThreadProc(LPVOID lpParam);
+static DWORD WINAPI SshAuthThreadProc(LPVOID lpParam);
 
 /* Connection callbacks */
 static void OnDataReceived(const unsigned char *data, int len, void *userdata);
 static void OnStatusChanged(int status, const char *msg, void *userdata);
 
 /* WinMain entry point */
+/* Global crash handler — shows exception code so we can diagnose libssh crashes */
+static LONG WINAPI CrashHandler(EXCEPTION_POINTERS *ep)
+{
+	char msg[256];
+	snprintf(msg, sizeof(msg),
+		"Unhandled exception 0x%08lx at 0x%p\nThe application will now exit.",
+		ep->ExceptionRecord->ExceptionCode,
+		(void *)ep->ExceptionRecord->ExceptionAddress);
+	MessageBoxA(NULL, msg, "MacConnect Fatal Error", MB_OK | MB_ICONERROR);
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
 	MSG msg;
 	WSADATA wsd;
 
 	WSAStartup(MAKEWORD(2, 2), &wsd);
+	SetUnhandledExceptionFilter(CrashHandler);
+
+	/* Initialize libssh before any ssh_new()/ssh_connect() calls.
+	 * This also triggers mbedTLS threading init; if it fails we report early. */
+	if (ssh_init() < 0) {
+		MessageBoxA(NULL,
+			"Failed to initialize libssh.\n"
+			"SSH connections will not be available.",
+			"MacConnect Warning", MB_OK | MB_ICONWARNING);
+		/* Non-fatal: MAC-Telnet still works. */
+	}
 
 	INITCOMMONCONTROLSEX iccex;
 	iccex.dwSize = sizeof(iccex);
@@ -171,7 +227,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 	InitCommonControlsEx(&iccex);
 
 	InitializeCriticalSection(&device_cs);
+	InitializeCriticalSection(&g_ssh_input_cs);
 	mactelnet_conn_init(&g_conn);
+	ssh_conn_init(&g_ssh_conn);
 
 	if (!InitApplication(hInstance))
 		return FALSE;
@@ -185,6 +243,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 	}
 
 	DeleteCriticalSection(&device_cs);
+	DeleteCriticalSection(&g_ssh_input_cs);
+	/* (critical sections freed in WM_DESTROY) */
+	ssh_finalize();
 	WSACleanup();
 
 	return (int)msg.wParam;
@@ -247,24 +308,47 @@ static void CreateMainControls(HWND hWnd)
 {
 	HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 	
-	/* MAC Address label and edit */
-	CreateWindow("STATIC", "MAC Address:",
+	/* Protocol dropdown label */
+	CreateWindow("STATIC", "Protocol:",
 		WS_VISIBLE | WS_CHILD | SS_LEFT,
-		10, 10, 80, 20, hWnd, NULL, hInst, NULL);
+		10, 10, 50, 20, hWnd, NULL, hInst, NULL);
+	
+	/* Protocol dropdown */
+	hProtocolCombo = CreateWindow("COMBOBOX", NULL,
+		WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+		65, 8, 100, 200, hWnd, (HMENU)IDC_PROTOCOL, hInst, NULL);
+	
+	SendMessage(hProtocolCombo, CB_ADDSTRING, 0, (LPARAM)"MAC-TELNET");
+	SendMessage(hProtocolCombo, CB_ADDSTRING, 0, (LPARAM)"SSH");
+	SendMessage(hProtocolCombo, CB_SETCURSEL, PROTOCOL_MAC_TELNET, 0);
+	
+	/* MAC Address label and edit */
+	CreateWindow("STATIC", "Address:",
+		WS_VISIBLE | WS_CHILD | SS_LEFT,
+		175, 10, 50, 20, hWnd, NULL, hInst, NULL);
 	
 	hMacEdit = CreateWindow("EDIT", "",
 		WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL | ES_READONLY,
-		100, 10, 200, 20, hWnd, (HMENU)IDC_MAC_ADDRESS, hInst, NULL);
+		230, 10, 200, 20, hWnd, (HMENU)IDC_MAC_ADDRESS, hInst, NULL);
+	
+	/* Port input (hidden by default, shown for SSH) */
+	hPortLabel = CreateWindow("STATIC", "Port:",
+		WS_CHILD | SS_LEFT,
+		440, 10, 30, 20, hWnd, NULL, hInst, NULL);
+	
+	hPortEdit = CreateWindow("EDIT", "22",
+		WS_CHILD | WS_BORDER | ES_NUMBER,
+		475, 10, 50, 20, hWnd, (HMENU)IDC_PORT, hInst, NULL);
 	
 	/* Connect button */
 	hConnectBtn = CreateWindow("BUTTON", "Connect",
 		WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-		320, 8, 100, 26, hWnd, (HMENU)IDC_CONNECT_BTN, hInst, NULL);
+		540, 8, 100, 26, hWnd, (HMENU)IDC_CONNECT_BTN, hInst, NULL);
 	
 	/* Refresh button */
 	hRefreshBtn = CreateWindow("BUTTON", "Refresh",
 		WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-		430, 8, 100, 26, hWnd, (HMENU)IDC_REFRESH_BTN, hInst, NULL);
+		650, 8, 100, 26, hWnd, (HMENU)IDC_REFRESH_BTN, hInst, NULL);
 	
 	/* Device list view */
 	hDeviceList = CreateWindow(WC_LISTVIEW, "",
@@ -323,9 +407,38 @@ static void CreateMainControls(HWND hWnd)
 	
 	/* Set fonts */
 	SendMessage(hMacEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+	SendMessage(hPortEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
 	SendMessage(hConnectBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
 	SendMessage(hRefreshBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
 	SendMessage(hDeviceList, WM_SETFONT, (WPARAM)hFont, TRUE);
+	SendMessage(hProtocolCombo, WM_SETFONT, (WPARAM)hFont, TRUE);
+}
+
+/* Get current protocol selection */
+static int GetSelectedProtocol(void)
+{
+	return (int)SendMessage(hProtocolCombo, CB_GETCURSEL, 0, 0);
+}
+
+/* Update UI state based on selected protocol */
+static void UpdateUIForProtocol(int protocol)
+{
+	if (protocol == PROTOCOL_SSH) {
+		/* SSH: show port, make address editable */
+		ShowWindow(hPortLabel, SW_SHOW);
+		ShowWindow(hPortEdit, SW_SHOW);
+		SetWindowLongPtr(hMacEdit, GWL_STYLE, 
+			GetWindowLongPtr(hMacEdit, GWL_STYLE) & ~ES_READONLY);
+		SetWindowText(hMacEdit, "");
+	} else {
+		/* MAC-TELNET: hide port, make address readonly */
+		ShowWindow(hPortLabel, SW_HIDE);
+		ShowWindow(hPortEdit, SW_HIDE);
+		SetWindowLongPtr(hMacEdit, GWL_STYLE, 
+			GetWindowLongPtr(hMacEdit, GWL_STYLE) | ES_READONLY);
+	}
+	/* Force redraw */
+	SetWindowPos(hMacEdit, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 }
 
 /* Resize controls */
@@ -484,13 +597,59 @@ static void RefreshDeviceList(void)
 	hDiscoverThread = CreateThread(NULL, 0, DiscoverThreadProc, NULL, 0, NULL);
 }
 
-/* Device selection */
-static void OnDeviceSelected(int index)
+/* Device selection - column-aware */
+static void OnDeviceSelected(int index, int column)
 {
 	if (index < 0 || index >= device_count)
 		return;
 	
-	SetWindowText(hMacEdit, devices[index].mac_str);
+	struct device_info *dev = &devices[index];
+	
+	/* Determine what value to put in address box and protocol based on clicked column */
+	int protocol = PROTOCOL_MAC_TELNET;
+	const char *address = NULL;
+	
+	switch (column) {
+	case COL_MAC:
+		protocol = PROTOCOL_MAC_TELNET;
+		address = dev->mac_str;
+		break;
+	case COL_IP:
+		if (dev->ip_str[0]) {
+			protocol = PROTOCOL_SSH;
+			address = dev->ip_str;
+		} else {
+			/* Fall back to MAC if no IP */
+			protocol = PROTOCOL_MAC_TELNET;
+			address = dev->mac_str;
+		}
+		break;
+	case COL_IPV6_LOCAL:
+		if (dev->ipv6_local_str[0]) {
+			protocol = PROTOCOL_SSH;
+			address = dev->ipv6_local_str;
+		} else if (dev->ipv6_global_str[0]) {
+			protocol = PROTOCOL_SSH;
+			address = dev->ipv6_global_str;
+		} else {
+			/* Fall back to MAC if no IPv6 */
+			protocol = PROTOCOL_MAC_TELNET;
+			address = dev->mac_str;
+		}
+		break;
+	default:
+		/* For other columns, use MAC address */
+		protocol = PROTOCOL_MAC_TELNET;
+		address = dev->mac_str;
+		break;
+	}
+	
+	/* Update protocol dropdown */
+	SendMessage(hProtocolCombo, CB_SETCURSEL, protocol, 0);
+	UpdateUIForProtocol(protocol);
+	
+	/* Update address box */
+	SetWindowText(hMacEdit, address);
 }
 
 /* Copy functions */
@@ -1000,62 +1159,65 @@ static LRESULT CALLBACK TerminalWndProc(HWND hWnd, UINT message, WPARAM wParam, 
 		TerminalPaint(hWnd);
 		return 0;
 		
-	case WM_CHAR:
-		/* Send character to server */
-		if (g_conn_ctx.connected && g_conn.connected) {
-			unsigned char c = (unsigned char)wParam;
-			mactelnet_send(&g_conn, &c, 1);
-			/* Debug: show last sent byte in title */
-			{
-				char title[64];
-				snprintf(title, sizeof(title), "MacConnect Terminal [sent 0x%02X]", c);
-				SetWindowText(hWnd, title);
+	case WM_CHAR: {
+		unsigned char c = (unsigned char)wParam;
+		if (g_conn_type == CONN_TYPE_SSH && g_conn_ctx.connected) {
+			/* SSH: either feed auth line-input or send directly to channel */
+			EnterCriticalSection(&g_ssh_input_cs);
+			BOOL auth_waiting = !g_ssh_input_ready && g_ssh_conn.session != NULL && g_ssh_conn.channel == NULL;
+			LeaveCriticalSection(&g_ssh_input_cs);
+			if (auth_waiting) {
+				/* Auth phase: accumulate line, handle backspace, Enter submits */
+				EnterCriticalSection(&g_ssh_input_cs);
+				int cur_len = (int)strlen(g_ssh_input_line);
+				if (c == '\r' || c == '\n') {
+					g_ssh_input_ready = TRUE;
+				} else if (c == '\b' || c == 127) {
+					if (cur_len > 0) {
+						g_ssh_input_line[cur_len - 1] = '\0';
+						if (g_ssh_input_echo) {
+							TerminalProcessData((const unsigned char *)"\b \b", 3);
+						}
+					}
+				} else if (c >= 32 && cur_len < (int)sizeof(g_ssh_input_line) - 1) {
+					g_ssh_input_line[cur_len] = (char)c;
+					g_ssh_input_line[cur_len + 1] = '\0';
+					if (g_ssh_input_echo) {
+						TerminalProcessData(&c, 1);
+					}
+				}
+				LeaveCriticalSection(&g_ssh_input_cs);
+			} else if (g_ssh_conn.connected && g_ssh_conn.channel != NULL) {
+				/* Shell phase: send directly */
+				ssh_conn_send(&g_ssh_conn, &c, 1);
 			}
+		} else if (g_conn_type == CONN_TYPE_MAC && g_conn_ctx.connected && g_conn.connected) {
+			mactelnet_send(&g_conn, &c, 1);
 		}
 		return 0;
-		
-	case WM_KEYDOWN:
-		/* Handle special keys NOT generated by WM_CHAR (arrows, etc.) */
-		/* VK_RETURN, VK_BACK, VK_TAB are handled in WM_CHAR - do NOT handle here */
-		if (g_conn_ctx.connected && g_conn.connected) {
-			unsigned char seq[8];
-			int len = 0;
-			
-			switch (wParam) {
-			case VK_UP:
-				seq[0] = 0x1B; seq[1] = '['; seq[2] = 'A';
-				len = 3;
-				break;
-			case VK_DOWN:
-				seq[0] = 0x1B; seq[1] = '['; seq[2] = 'B';
-				len = 3;
-				break;
-			case VK_RIGHT:
-				seq[0] = 0x1B; seq[1] = '['; seq[2] = 'C';
-				len = 3;
-				break;
-			case VK_LEFT:
-				seq[0] = 0x1B; seq[1] = '['; seq[2] = 'D';
-				len = 3;
-				break;
-			case VK_HOME:
-				seq[0] = 0x1B; seq[1] = '['; seq[2] = 'H';
-				len = 3;
-				break;
-			case VK_END:
-				seq[0] = 0x1B; seq[1] = '['; seq[2] = 'F';
-				len = 3;
-				break;
-			case VK_DELETE:
-				seq[0] = 0x1B; seq[1] = '['; seq[2] = '3'; seq[3] = '~';
-				len = 4;
-				break;
-			}
-			
-			if (len > 0)
+	}
+
+	case WM_KEYDOWN: {
+		/* Special keys (arrows etc.) - only for shell phase */
+		unsigned char seq[8];
+		int len = 0;
+		switch (wParam) {
+		case VK_UP:    seq[0]=0x1B; seq[1]='['; seq[2]='A'; len=3; break;
+		case VK_DOWN:  seq[0]=0x1B; seq[1]='['; seq[2]='B'; len=3; break;
+		case VK_RIGHT: seq[0]=0x1B; seq[1]='['; seq[2]='C'; len=3; break;
+		case VK_LEFT:  seq[0]=0x1B; seq[1]='['; seq[2]='D'; len=3; break;
+		case VK_HOME:  seq[0]=0x1B; seq[1]='['; seq[2]='H'; len=3; break;
+		case VK_END:   seq[0]=0x1B; seq[1]='['; seq[2]='F'; len=3; break;
+		case VK_DELETE: seq[0]=0x1B; seq[1]='['; seq[2]='3'; seq[3]='~'; len=4; break;
+		}
+		if (len > 0) {
+			if (g_conn_type == CONN_TYPE_SSH && g_ssh_conn.connected && g_ssh_conn.channel)
+				ssh_conn_send(&g_ssh_conn, seq, len);
+			else if (g_conn_type == CONN_TYPE_MAC && g_conn_ctx.connected && g_conn.connected)
 				mactelnet_send(&g_conn, seq, len);
 		}
 		return 0;
+	}
 		
 	case WM_TIMER:
 		if (wParam == 1) {
@@ -1077,8 +1239,13 @@ static LRESULT CALLBACK TerminalWndProc(HWND hWnd, UINT message, WPARAM wParam, 
 		if (g_term.hFont)
 			DeleteObject(g_term.hFont);
 		g_term.hWnd = NULL;
-		mactelnet_disconnect(&g_conn);
+		if (g_conn_type == CONN_TYPE_SSH) {
+			ssh_conn_disconnect(&g_ssh_conn);
+		} else {
+			mactelnet_disconnect(&g_conn);
+		}
 		g_conn_ctx.connected = 0;
+		g_conn_type = CONN_TYPE_NONE;
 		return 0;
 		
 	default:
@@ -1092,7 +1259,133 @@ static DWORD WINAPI TerminalThreadProc(LPVOID lpParam)
 		if (mactelnet_run(&g_conn, 10) < 0)
 			break;
 	}
-	
+	return 0;
+}
+
+/* SSH data read loop */
+static DWORD WINAPI SshTerminalThreadProc(LPVOID lpParam)
+{
+	while (g_ssh_conn.connected) {
+		if (ssh_conn_run(&g_ssh_conn, 10) < 0)
+			break;
+		Sleep(10);
+	}
+	/* Notify main thread that SSH session has ended */
+	if (g_conn_type == CONN_TYPE_SSH) {
+		PostMessage(hMainWnd, WM_CONNECTION_STATUS,
+			(WPARAM)SSH_STATUS_DISCONNECTED, (LPARAM)_strdup("SSH session closed"));
+	}
+	return 0;
+}
+
+/* Helper: write a string directly to the terminal screen buffer and refresh */
+/* TerminalPostString: thread-safe terminal write — posts WM_TERMINAL_DATA to main thread.
+ * Always use this from worker threads (SshAuthThreadProc etc.) */
+static void TerminalPostString(const char *s)
+{
+	int len = (int)strlen(s);
+	if (len <= 0) return;
+	unsigned char *buf = (unsigned char *)malloc(len);
+	if (buf) {
+		memcpy(buf, s, len);
+		PostMessage(hMainWnd, WM_TERMINAL_DATA, (WPARAM)buf, (LPARAM)len);
+	}
+}
+
+/* Helper: read one line of input from the terminal.
+ * Blocks until the user presses Enter (input fed via WM_CHAR → g_ssh_input_line).
+ * echo=TRUE shows the typed characters, echo=FALSE hides them (password). */
+static int SshReadLine(char *buf, int buflen, BOOL echo)
+{
+	EnterCriticalSection(&g_ssh_input_cs);
+	g_ssh_input_line[0] = '\0';
+	g_ssh_input_ready = FALSE;
+	g_ssh_input_echo = echo;
+	LeaveCriticalSection(&g_ssh_input_cs);
+
+	/* Wait for the main thread to deliver a complete line */
+	while (!g_ssh_input_ready) {
+		if (!g_ssh_conn.connected)
+			return -1;
+		Sleep(50);
+	}
+
+	strncpy(buf, g_ssh_input_line, buflen - 1);
+	buf[buflen - 1] = '\0';
+	return 0;
+}
+
+/* SSH auth + channel-open thread.
+ * Performs TCP connect, login prompts, auth, and shell open — all off the GUI thread.
+ * Uses TerminalPostString (not TerminalWriteString) to avoid race with WM_PAINT. */
+static DWORD WINAPI SshAuthThreadProc(LPVOID lpParam)
+{
+	char username[128];
+	char password[128];
+	char prompt[300];
+
+	/* Step 1: TCP connect (may block up to 10s) */
+	TerminalPostString("Connecting...");
+	if (ssh_conn_connect(&g_ssh_conn, g_ssh_host, g_ssh_port) < 0) {
+		char errmsg[600];
+		snprintf(errmsg, sizeof(errmsg),
+			"\r\nConnection to %s:%d failed: %s\r\n",
+			g_ssh_host, g_ssh_port,
+			g_ssh_conn.last_error[0] ? g_ssh_conn.last_error : "unknown");
+		TerminalPostString(errmsg);
+		g_conn_ctx.connected = 0;
+		g_ssh_conn.connected = 0;
+		Sleep(3000);
+		PostMessage(hMainWnd, WM_CONNECTION_STATUS,
+			(WPARAM)SSH_STATUS_DISCONNECTED, (LPARAM)_strdup("Connection failed"));
+		return 0;
+	}
+	TerminalPostString(" connected.\r\n");
+
+	/* Step 2: Prompt for username */
+	TerminalPostString("login as: ");
+	if (SshReadLine(username, sizeof(username), TRUE) < 0)
+		return 0;
+	TerminalPostString("\r\n");
+
+	/* Step 3: Prompt for password */
+	snprintf(prompt, sizeof(prompt), "%s@%s's password: ", username, g_ssh_conn.host);
+	TerminalPostString(prompt);
+	if (SshReadLine(password, sizeof(password), FALSE) < 0)
+		return 0;
+	TerminalPostString("\r\n");
+
+	/* Step 4: Authenticate */
+	if (ssh_conn_auth_password(&g_ssh_conn, username, password) < 0) {
+		char errmsg[600];
+		snprintf(errmsg, sizeof(errmsg), "Authentication failed: %s\r\n",
+			g_ssh_conn.last_error[0] ? g_ssh_conn.last_error : "wrong credentials");
+		TerminalPostString(errmsg);
+		ssh_conn_disconnect(&g_ssh_conn);
+		g_conn_ctx.connected = 0;
+		Sleep(2000);
+		PostMessage(hMainWnd, WM_CONNECTION_STATUS,
+			(WPARAM)SSH_STATUS_AUTH_FAILED, (LPARAM)_strdup("Authentication failed"));
+		return 0;
+	}
+
+	/* Step 5: Open PTY + shell channel */
+	if (ssh_conn_open_channel(&g_ssh_conn) < 0) {
+		char errmsg[600];
+		snprintf(errmsg, sizeof(errmsg), "Failed to open shell: %s\r\n",
+			g_ssh_conn.last_error[0] ? g_ssh_conn.last_error : "unknown");
+		TerminalPostString(errmsg);
+		ssh_conn_disconnect(&g_ssh_conn);
+		g_conn_ctx.connected = 0;
+		Sleep(2000);
+		PostMessage(hMainWnd, WM_CONNECTION_STATUS,
+			(WPARAM)SSH_STATUS_ERROR, (LPARAM)_strdup("Failed to open shell channel"));
+		return 0;
+	}
+
+	/* Step 6: Start data reader thread */
+	CreateThread(NULL, 0, SshTerminalThreadProc, NULL, 0, NULL);
+
 	return 0;
 }
 
@@ -1147,55 +1440,94 @@ static void OnStatusChanged(int status, const char *msg, void *userdata)
 /* Handle connect */
 static void OnConnect(void)
 {
-	char mac_str[64];
-	unsigned char mac[ETH_ALEN];
-	
-	GetWindowText(hMacEdit, mac_str, sizeof(mac_str));
-	
-	if (strlen(mac_str) == 0) {
-		MessageBox(hMainWnd, "Please select a device from the list.", "Error", MB_OK | MB_ICONWARNING);
+	char addr_str[256];
+	int protocol = GetSelectedProtocol();
+
+	GetWindowText(hMacEdit, addr_str, sizeof(addr_str));
+
+	if (strlen(addr_str) == 0) {
+		MessageBox(hMainWnd, "Please enter or select an address.", "Error", MB_OK | MB_ICONWARNING);
 		return;
 	}
-	
-	if (!parse_mac(mac_str, mac)) {
-		MessageBox(hMainWnd, "Invalid MAC address.", "Error", MB_OK | MB_ICONERROR);
-		return;
-	}
-	
-	/* Create terminal window */
-	if (!CreateTerminalWindow()) {
-		MessageBox(hMainWnd, "Failed to create terminal window.", "Error", MB_OK | MB_ICONERROR);
-		return;
-	}
-	
-	/* Initialize connection */
-	mactelnet_conn_init(&g_conn);
-	g_conn_ctx.connected = 1;
-	g_conn_ctx.hTerminal = g_term.hWnd;
-	g_conn_ctx.conn = &g_conn;
-	
-	/* Set callbacks */
-	mactelnet_set_callbacks(OnDataReceived, OnStatusChanged, &g_conn_ctx);
-	
-	/* Connect */
-	SendMessage(hStatusBar, SB_SETTEXT, 0, (LPARAM)"Connecting...");
-	
-	if (mactelnet_connect(&g_conn, mac, 5) < 0) {
-		MessageBox(hMainWnd, "Failed to connect to device.\nPlease check the MAC address and try again.", 
-			"Connection Failed", MB_OK | MB_ICONERROR);
-		if (g_term.hWnd) {
-			DestroyWindow(g_term.hWnd);
-			g_term.hWnd = NULL;
+
+	if (protocol == PROTOCOL_SSH) {
+		/* ---- SSH connection ---- */
+		char port_str[16];
+		GetWindowText(hPortEdit, port_str, sizeof(port_str));
+		int port = atoi(port_str);
+		if (port <= 0) port = 22;
+
+		/* Create terminal window first */
+		if (!CreateTerminalWindow()) {
+			MessageBox(hMainWnd, "Failed to create terminal window.", "Error", MB_OK | MB_ICONERROR);
+			return;
 		}
-		g_conn_ctx.connected = 0;
-		SendMessage(hStatusBar, SB_SETTEXT, 0, (LPARAM)"Connection failed");
-		return;
+
+		/* Clean up any previous session */
+		ssh_conn_disconnect(&g_ssh_conn);
+		ssh_conn_init(&g_ssh_conn);
+		g_conn_type = CONN_TYPE_SSH;
+
+		/* Save target for the auth thread */
+		strncpy(g_ssh_host, addr_str, sizeof(g_ssh_host) - 1);
+		g_ssh_host[sizeof(g_ssh_host) - 1] = '\0';
+		g_ssh_port = port;
+
+		/* Set callbacks */
+		ssh_conn_set_callbacks(OnDataReceived, OnStatusChanged, &g_conn_ctx);
+
+		/* Mark as connecting — input routing active */
+		g_conn_ctx.connected = 1;
+		g_ssh_conn.connected = 1;
+
+		/* All blocking work (TCP connect + auth + shell) done in background thread */
+		CreateThread(NULL, 0, SshAuthThreadProc, NULL, 0, NULL);
+
+		SendMessage(hStatusBar, SB_SETTEXT, 0, (LPARAM)"SSH: connecting...");
+
+	} else {
+		/* ---- MAC-TELNET connection ---- */
+		unsigned char mac[ETH_ALEN];
+
+		if (!parse_mac(addr_str, mac)) {
+			MessageBox(hMainWnd, "Invalid MAC address.", "Error", MB_OK | MB_ICONERROR);
+			return;
+		}
+
+		/* Create terminal window */
+		if (!CreateTerminalWindow()) {
+			MessageBox(hMainWnd, "Failed to create terminal window.", "Error", MB_OK | MB_ICONERROR);
+			return;
+		}
+
+		g_conn_type = CONN_TYPE_MAC;
+
+		/* Initialize connection */
+		mactelnet_conn_init(&g_conn);
+		g_conn_ctx.connected = 1;
+		g_conn_ctx.hTerminal = g_term.hWnd;
+		g_conn_ctx.conn = &g_conn;
+
+		/* Set callbacks */
+		mactelnet_set_callbacks(OnDataReceived, OnStatusChanged, &g_conn_ctx);
+
+		SendMessage(hStatusBar, SB_SETTEXT, 0, (LPARAM)"Connecting...");
+
+		if (mactelnet_connect(&g_conn, mac, 5) < 0) {
+			MessageBox(hMainWnd, "Failed to connect to device.\nPlease check the MAC address and try again.",
+				"Connection Failed", MB_OK | MB_ICONERROR);
+			if (g_term.hWnd) { DestroyWindow(g_term.hWnd); g_term.hWnd = NULL; }
+			g_conn_ctx.connected = 0;
+			g_conn_type = CONN_TYPE_NONE;
+			SendMessage(hStatusBar, SB_SETTEXT, 0, (LPARAM)"Connection failed");
+			return;
+		}
+
+		/* Start terminal thread */
+		CreateThread(NULL, 0, TerminalThreadProc, NULL, 0, NULL);
+
+		SendMessage(hStatusBar, SB_SETTEXT, 0, (LPARAM)"Connected");
 	}
-	
-	/* Start terminal thread */
-	CreateThread(NULL, 0, TerminalThreadProc, NULL, 0, NULL);
-	
-	SendMessage(hStatusBar, SB_SETTEXT, 0, (LPARAM)"Connected");
 }
 
 /* Main window procedure */
@@ -1213,6 +1545,13 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
 	
 	case WM_COMMAND:
 		switch (LOWORD(wParam)) {
+		case IDC_PROTOCOL:
+			if (HIWORD(wParam) == CBN_SELCHANGE) {
+				int protocol = GetSelectedProtocol();
+				UpdateUIForProtocol(protocol);
+			}
+			return 0;
+		
 		case IDC_CONNECT_BTN:
 		case IDM_CONTEXT_CONNECT:
 			OnConnect();
@@ -1233,7 +1572,22 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
 			LPNMLISTVIEW pnmv = (LPNMLISTVIEW)lParam;
 			if (pnmv->hdr.code == LVN_ITEMCHANGED) {
 				if (pnmv->uNewState & LVIS_SELECTED) {
-					OnDeviceSelected(pnmv->iItem);
+					/* Default to MAC address on selection */
+					OnDeviceSelected(pnmv->iItem, COL_MAC);
+				}
+			}
+			if (pnmv->hdr.code == NM_CLICK) {
+				/* Left click: determine clicked column and update address/protocol */
+				POINT pt;
+				GetCursorPos(&pt);
+				ScreenToClient(hDeviceList, &pt);
+				
+				LVHITTESTINFO hit;
+				hit.pt = pt;
+				ListView_SubItemHitTest(hDeviceList, &hit);
+				
+				if (hit.iItem >= 0) {
+					OnDeviceSelected(hit.iItem, hit.iSubItem);
 				}
 			}
 			if (pnmv->hdr.code == NM_DBLCLK) {
@@ -1250,7 +1604,7 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
 				
 				if (hit.iItem >= 0) {
 					ListView_SetItemState(hDeviceList, hit.iItem, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-					OnDeviceSelected(hit.iItem);
+					OnDeviceSelected(hit.iItem, hit.iSubItem);
 					
 					g_clicked_column = hit.iSubItem;
 					
@@ -1269,14 +1623,34 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
 	case WM_CHAR:
 		/* Forward keyboard input to active terminal connection
 		 * (handles case when main window has focus instead of terminal) */
-		if (g_conn_ctx.connected && g_conn.connected && g_term.hWnd) {
+		{
 			unsigned char c = (unsigned char)wParam;
-			mactelnet_send(&g_conn, &c, 1);
-			/* Debug: show last sent byte in title */
-			{
-				char title[64];
-				snprintf(title, sizeof(title), "MacConnect Terminal [sent 0x%02X]", c);
-				SetWindowText(g_term.hWnd, title);
+			if (g_conn_type == CONN_TYPE_SSH && g_conn_ctx.connected) {
+				/* reuse same logic as TerminalWndProc WM_CHAR */
+				EnterCriticalSection(&g_ssh_input_cs);
+				BOOL auth_waiting = !g_ssh_input_ready && g_ssh_conn.session != NULL && g_ssh_conn.channel == NULL;
+				LeaveCriticalSection(&g_ssh_input_cs);
+				if (auth_waiting) {
+					EnterCriticalSection(&g_ssh_input_cs);
+					int cur_len = (int)strlen(g_ssh_input_line);
+					if (c == '\r' || c == '\n') {
+						g_ssh_input_ready = TRUE;
+					} else if ((c == '\b' || c == 127) && cur_len > 0) {
+						g_ssh_input_line[cur_len - 1] = '\0';
+						if (g_ssh_input_echo)
+							TerminalProcessData((const unsigned char *)"\b \b", 3);
+					} else if (c >= 32 && cur_len < (int)sizeof(g_ssh_input_line) - 1) {
+						g_ssh_input_line[cur_len] = (char)c;
+						g_ssh_input_line[cur_len+1] = '\0';
+						if (g_ssh_input_echo)
+							TerminalProcessData(&c, 1);
+					}
+					LeaveCriticalSection(&g_ssh_input_cs);
+				} else if (g_ssh_conn.connected && g_ssh_conn.channel != NULL) {
+					ssh_conn_send(&g_ssh_conn, &c, 1);
+				}
+			} else if (g_conn_type == CONN_TYPE_MAC && g_conn_ctx.connected && g_conn.connected && g_term.hWnd) {
+				mactelnet_send(&g_conn, &c, 1);
 			}
 		}
 		return 0;
@@ -1301,34 +1675,35 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
 	case WM_CONNECTION_STATUS: {
 		char *msg = (char *)lParam;
 		int status = (int)wParam;
-		
+
 		SendMessage(hStatusBar, SB_SETTEXT, 0, (LPARAM)msg);
-		
-		if (status == MT_STATUS_DISCONNECTED) {
-			/* Clean disconnect (e.g. user typed 'exit') — close terminal silently */
-			if (g_term.hWnd) {
-				DestroyWindow(g_term.hWnd);
-				g_term.hWnd = NULL;
-			}
+
+		if (status == MT_STATUS_DISCONNECTED || status == SSH_STATUS_DISCONNECTED) {
+			/* Clean disconnect — close terminal silently */
+			if (g_term.hWnd) { DestroyWindow(g_term.hWnd); g_term.hWnd = NULL; }
 			g_conn_ctx.connected = 0;
-		} else if (status == MT_STATUS_ERROR || status == MT_STATUS_TIMEOUT) {
+			g_ssh_conn.connected = 0;
+			g_conn_type = CONN_TYPE_NONE;
+		} else if (status == MT_STATUS_ERROR || status == MT_STATUS_TIMEOUT ||
+		           status == SSH_STATUS_ERROR || status == SSH_STATUS_AUTH_FAILED) {
 			MessageBox(hMainWnd, msg, "Connection Error", MB_OK | MB_ICONERROR);
-			if (g_term.hWnd) {
-				DestroyWindow(g_term.hWnd);
-				g_term.hWnd = NULL;
-			}
+			if (g_term.hWnd) { DestroyWindow(g_term.hWnd); g_term.hWnd = NULL; }
 			g_conn_ctx.connected = 0;
+			g_ssh_conn.connected = 0;
+			g_conn_type = CONN_TYPE_NONE;
 		}
-		
+
 		free(msg);
 		return 0;
 	}
 	
 	case WM_DESTROY:
-		if (hDiscoverThread) {
+		if (hDiscoverThread)
 			CloseHandle(hDiscoverThread);
-		}
-		mactelnet_disconnect(&g_conn);
+		if (g_conn_type == CONN_TYPE_SSH)
+			ssh_conn_disconnect(&g_ssh_conn);
+		else
+			mactelnet_disconnect(&g_conn);
 		PostQuitMessage(0);
 		return 0;
 	

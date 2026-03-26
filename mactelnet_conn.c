@@ -249,8 +249,11 @@ static int find_interface(mactelnet_conn_t *conn, int timeout)
 		/* Wait for response */
 		if (net_readable(macrecv, timeout * 1000))
 			return 1;
-		
+
+		/* No response on this interface — close test socket and reset the
+		 * global handle so it never appears valid to mactelnet_disconnect(). */
 		closesocket(mactest);
+		macsend = INVALID_SOCKET;
 	}
 	return 0;
 }
@@ -310,6 +313,11 @@ int mactelnet_connect(mactelnet_conn_t *conn, const unsigned char *server_mac, i
 	/* Find interface and send SESSIONSTART */
 	if (!find_interface(conn, timeout)) {
 		closesocket(macrecv);
+		macrecv = INVALID_SOCKET;
+		if (macsend != INVALID_SOCKET) {
+			closesocket(macsend);
+			macsend = INVALID_SOCKET;
+		}
 		if (status_callback)
 			status_callback(MT_STATUS_ERROR, "No response from server", callback_userdata);
 		return -1;
@@ -319,7 +327,9 @@ int mactelnet_connect(mactelnet_conn_t *conn, const unsigned char *server_mac, i
 	result = net_recv_packet(macrecv, &hdr, NULL);
 	if (result < 1) {
 		closesocket(macrecv);
+		macrecv = INVALID_SOCKET;
 		closesocket(macsend);
+		macsend = INVALID_SOCKET;
 		if (status_callback)
 			status_callback(MT_STATUS_ERROR, "Connection failed", callback_userdata);
 		return -1;
@@ -328,7 +338,9 @@ int mactelnet_connect(mactelnet_conn_t *conn, const unsigned char *server_mac, i
 	/* Handle first packet */
 	if (handle_packet(&hdr, result, conn) < 0) {
 		closesocket(macrecv);
+		macrecv = INVALID_SOCKET;
 		closesocket(macsend);
+		macsend = INVALID_SOCKET;
 		return -1;
 	}
 	
