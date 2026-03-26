@@ -1,3 +1,6 @@
 *.o
+*.res
 mactelnet.exe
 macConnect.exe
+build
+libssh-0.12.0

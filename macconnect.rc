@@ -1,0 +1,4 @@
+// macConnect resource file
+#include <windows.h>
+
+1 ICON "macConnect.ico"
