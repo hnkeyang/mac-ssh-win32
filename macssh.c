@@ -88,6 +88,31 @@ extern int plink_main(int argc, char **argv);
 
 static int handle_packet(struct mt_mactelnet_hdr *pkt, int data_len);
 
+/* Parse MAC address string (format: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX) */
+static int parse_mac(const char *str, unsigned char *mac)
+{
+	int i;
+	unsigned int vals[ETH_ALEN];
+	
+	/* Try colon-separated format */
+	if (sscanf(str, "%02x:%02x:%02x:%02x:%02x:%02x",
+		&vals[0], &vals[1], &vals[2], &vals[3], &vals[4], &vals[5]) == ETH_ALEN) {
+		for (i = 0; i < ETH_ALEN; i++)
+			mac[i] = (unsigned char)vals[i];
+		return 1;
+	}
+	
+	/* Try dash-separated format */
+	if (sscanf(str, "%02x-%02x-%02x-%02x-%02x-%02x",
+		&vals[0], &vals[1], &vals[2], &vals[3], &vals[4], &vals[5]) == ETH_ALEN) {
+		for (i = 0; i < ETH_ALEN; i++)
+			mac[i] = (unsigned char)vals[i];
+		return 1;
+	}
+	
+	return 0;
+}
+
 static void print_version() {
 	fprintf(stderr, PROGRAM_NAME " " PROGRAM_VERSION "\n");
 }
@@ -702,7 +727,43 @@ int main (int argc, char **argv) {
 		return 0;
 	}
 
-	select_mndp();
+	/* If MAC address or identity is provided as argument, use it directly */
+	if (poptind < macssh_argc) {
+		const char *target = argv[poptind];
+		unsigned char mac[ETH_ALEN];
+		
+		/* Try to parse as MAC address first */
+		if (parse_mac(target, mac)) {
+			/* Direct MAC connection - create a temporary server entry */
+			server = calloc(1, sizeof(struct mndphost));
+			if (server) {
+				server->address = malloc(ETH_ALEN);
+				if (server->address) {
+					memcpy(server->address, mac, ETH_ALEN);
+				}
+			}
+		} else {
+			/* Try to find by identity via MNDP */
+			mndp_discover(mndp_timeout > 0 ? mndp_timeout : 3);
+			
+			struct mndphost *host;
+			list_for_each_entry(host, &mndphosts, list) {
+				if (host->identity && strcasecmp(host->identity, target) == 0) {
+					server = host;
+					break;
+				}
+			}
+			
+			if (!server) {
+				fprintf(stderr, "Device '%s' not found via MNDP.\n", target);
+				mndp_free_hosts();
+				return 1;
+			}
+		}
+	} else {
+		/* No argument provided - use interactive MNDP selection */
+		select_mndp();
+	}
 
 	if (!server) {
 		mndp_free_hosts();
