@@ -284,12 +284,12 @@ static void CreateMainControls(HWND hWnd)
 	
 	lvc.iSubItem = COL_IP;
 	lvc.pszText = "IP Address";
-	lvc.cx = 100;
+	lvc.cx = 110;
 	ListView_InsertColumn(hDeviceList, COL_IP, &lvc);
 	
 	lvc.iSubItem = COL_IPV6_LOCAL;
 	lvc.pszText = "IPv6";
-	lvc.cx = 160;
+	lvc.cx = 209;
 	ListView_InsertColumn(hDeviceList, COL_IPV6_LOCAL, &lvc);
 	
 	lvc.iSubItem = COL_IDENTITY;
